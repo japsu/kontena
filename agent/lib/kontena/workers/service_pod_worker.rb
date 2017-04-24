@@ -7,24 +7,62 @@ require_relative '../helpers/event_log_helper'
 module Kontena::Workers
   class ServicePodWorker
     include Celluloid
+    include Celluloid::Notifications
     include Kontena::Logging
     include Kontena::ServicePods::Common
     include Kontena::Helpers::RpcHelper
     include Kontena::Helpers::EventLogHelper
 
     attr_reader :node, :prev_state, :service_pod
-    attr_accessor :service_pod
+    attr_accessor :service_pod, :container_state_changed
 
     def initialize(node, service_pod)
       @node = node
       @service_pod = service_pod
       @prev_state = nil # sync'd to master
+      @container_state_changed = true
+      @deploy_rev_changed = false
+      subscribe('container:event', :on_container_event)
     end
 
     # @param [Kontena::Models::ServicePod] service_pod
     def update(service_pod)
-      @service_pod = service_pod
-      apply
+      if needs_apply?(service_pod)
+        check_deploy_rev(service_pod)
+        @service_pod = service_pod
+        apply
+      else
+        @service_pod = service_pod
+      end
+    end
+
+    # @param [Kontena::Models::ServicePod] service_pod
+    # @return [Boolean]
+    def needs_apply?(service_pod)
+      @container_state_changed ||
+        @service_pod.desired_state != service_pod.desired_state ||
+          @service_pod.deploy_rev != service_pod.deploy_rev
+    end
+
+    # @param [Kontena::Models::ServicePod] service_pod
+    def check_deploy_rev(service_pod)
+      return if @service_pod.deploy_rev.nil? || service_pod.deploy_rev.nil?
+      @deploy_rev_changed = @service_pod.deploy_rev != service_pod.deploy_rev
+    end
+
+    # @return [Boolean]
+    def deploy_rev_changed?
+      @deploy_rev_changed == true
+    end
+
+    # @param [String] topic
+    # @param [Docker::Event] e
+    def on_container_event(topic, e)
+      attrs = e.actor.attributes
+      if attrs['io.kontena.service.id'] == @service_pod.service_id &&
+          attrs['io.kontena.service.instance_number'].to_i == @service_pod.instance_number
+        @container_state_changed = true
+      end
     end
 
     def destroy
@@ -37,9 +75,10 @@ module Kontena::Workers
         begin
           ensure_desired_state
         rescue => error
-          warn "failed to sync #{service_pod.name}: #{error}"
+          warn "failed to sync #{service_pod.name} at #{service_pod.deploy_rev}: #{error}"
           sync_state_to_master(current_state, error)
         else
+          @container_state_changed = false
           sync_state_to_master(current_state)
 
           # Only terminate this actor after we have succesfully ensure_terminated the Docker container
@@ -55,12 +94,12 @@ module Kontena::Workers
       if service_pod.running? && service_container.nil?
         info "creating #{service_pod.name}"
         ensure_running
+      elsif service_pod.running? && (service_container && service_container_outdated?(service_container))
+        info "re-creating #{service_pod.name}"
+        ensure_running
       elsif service_container && service_pod.running? && !service_container.running?
         info "starting #{service_pod.name}"
         ensure_started
-      elsif service_pod.running? && (service_container && service_container_outdated?(service_container, service_pod))
-        info "re-creating #{service_pod.name}"
-        ensure_running
       elsif service_pod.stopped? && (service_container && service_container.running?)
         info "stopping #{service_pod.name}"
         ensure_stopped
@@ -127,12 +166,60 @@ module Kontena::Workers
     end
 
     # @param [Docker::Container] service_container
-    # @param [Kontena::Models::ServicePod] service_pod
-    def service_container_outdated?(service_container, service_pod)
-      creator = Kontena::ServicePods::Creator.new(service_pod)
-      creator.container_outdated?(service_container) ||
-        creator.labels_outdated?(service_pod.labels, service_container) ||
-          creator.recreate_service_container?(service_container)
+    # @return [Boolean]
+    def service_container_outdated?(service_container)
+      outdated = container_outdated?(service_container) ||
+          labels_outdated?(service_container) ||
+          recreate_service_container?(service_container)
+      return true if outdated
+      return false unless deploy_rev_changed?
+
+      image_puller.ensure_image(
+        service_pod.image_name, service_pod.deploy_rev, service_pod.image_credentials
+      )
+
+      image_outdated?(service_container)
+    end
+
+    # @param [Docker::Container] service_container
+    # @return [Boolean]
+    def container_outdated?(service_container)
+      updated_at = DateTime.parse(service_pod.updated_at)
+      created = DateTime.parse(service_container.info['Created']) rescue nil
+      return true if created.nil?
+      return true if created < updated_at
+
+      false
+    end
+
+    # @param [Docker::Container] service_container
+    # @return [Boolean]
+    def image_outdated?(service_container)
+      image = Docker::Image.get(service_pod.image_name) rescue nil
+      return true unless image
+      return true if image.id != service_container.info['Image']
+
+      false
+    end
+
+    # @param [Docker::Container] service_container
+    # @return [Boolean]
+    def recreate_service_container?(service_container)
+      state = service_container.state
+      service_container.autostart? &&
+          !service_container.running? &&
+          (!state['Error'].empty? || state['ExitCode'].to_i != 0)
+    end
+
+    # @param [Docker::Container] service_container
+    # @return [Boolean]
+    def labels_outdated?(service_container)
+      service_pod.labels['io.kontena.load_balancer.name'] != service_container.labels['io.kontena.load_balancer.name']
+    end
+
+    # @return [Kontena::Workers::ImagePullWorker]
+    def image_puller
+      Actor[:image_pull_worker]
     end
 
     # @param [Kontena::Models::ServicePod] service_pod
