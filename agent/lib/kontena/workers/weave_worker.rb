@@ -34,6 +34,10 @@ module Kontena::Workers
       # ready to start handling container events
       subscribe('container:event', :on_container_event)
 
+      start_all_containers
+    end
+
+    def start_all_containers
       info 'attaching network to existing containers'
       Docker::Container.all(all: false).each do |container|
         self.start_container(container)
@@ -54,7 +58,7 @@ module Kontena::Workers
 
           wait_weave_running?
 
-          self.start
+          self.start_all_containers
         elsif container = Docker::Container.get(event.id) rescue nil
           self.start_container(container)
         else
