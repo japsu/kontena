@@ -51,7 +51,7 @@ describe Kontena::Workers::WeaveWorker do
 
     it 'calls #start on weave start event' do
       event = spy(:event, id: 'foobar', status: 'start', from: 'weaveworks/weave:1.4.5')
-      expect(subject.wrapped_object).to receive(:start).once
+      expect(subject.wrapped_object).to receive(:start_all_containers).once
       subject.on_container_event('topic', event)
     end
   end
