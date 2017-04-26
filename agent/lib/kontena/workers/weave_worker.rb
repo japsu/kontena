@@ -27,6 +27,7 @@ module Kontena::Workers
       self.start
     end
 
+    # Weave is running, so we can start doing our thing.
     def start
       @migrate_containers = network_adapter.get_containers
       debug "Scanned #{@migrate_containers.size} existing containers for potential migration: #{@migrate_containers}"
@@ -37,6 +38,16 @@ module Kontena::Workers
       start_all_containers
     end
 
+    # Ensure that all service containers are attached and registered in Weave DNS
+    #
+    # This is called in multiple cases:
+    # * the agent was installed, and weave was just launched... there might even be some deployed containers waiting to be attached
+    # * the agent was rebooted, and weave was restarted by Docker, but none of the containers are attached yet
+    # * the agent was restarted, so weave is still running, and the containers might already be attached
+    # * the agent was upgraded, so weave might be restarting, and some containers might be attached with the wrong netmask
+    # * the worker has crashed and restarted, so we might have missed some container events, and some containers might not be attached
+    # * the weave router container has crashed and restarted, so it will have forgotten Weave DNS names, but the containers will still be attached
+    # * the weave configuration may have changed, so the weave router container was re-created, so it iwll have forgotten Weave DNS names, but the containers will still be attached
     def start_all_containers
       info 'attaching network to existing containers'
       Docker::Container.all(all: false).each do |container|
